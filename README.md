@@ -1,6 +1,11 @@
-# llm-training-ablation-bench
+# LLM training ablation benchmark
 
 A/B experimentation framework for LLM training techniques on micro-scale models. Rapidly validate optimizers, architectures, training dynamics, embeddings, weight averaging, and quantization on consumer GPUs using synthetic data.
+
+--
+
+I created this project inspired by OpenAI's Parameter Golf Challenge to test different approaches and combinations, in order to easily identify what works and what doesn't. The code was written using a 3060 GPU with 12 GB of VRAM on Windows 11, but I believe it can be better adapted to other environments.
+
 
 ## Quick Start
 
@@ -65,11 +70,12 @@ pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
 
 # Install remaining dependencies
 pip install -r requirements.txt
-
+```
 **Note**: Install PyTorch with CUDA support first (as shown above) before running `pip install -r requirements.txt`. The default PyTorch package from PyPI is CPU-only.
 
 # Verify GPU is detected
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\"}')"
+```
+python -c 'import torch; print("CUDA:", torch.cuda.is_available(), "GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")'
 ```
 
 ## Usage
@@ -459,8 +465,7 @@ python -m runner --model micro_2L_64d
 
 Reinstall PyTorch with correct CUDA version:
 ```bash
-pip uninstall torch
-pip install torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Verify with:
