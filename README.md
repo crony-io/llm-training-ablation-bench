@@ -117,9 +117,15 @@ python -m runner --model micro_3L_96d --steps 500 --commands --id large_model
 
 ### Plot Results
 
+Charts are **auto-generated** at the end of each benchmark run if matplotlib is installed:
+
 ```bash
 python -m plotter results/bench_20260101_120000.jsonl
 ```
+
+If matplotlib is not installed, the benchmark still runs successfully - it simply skips chart generation with a notification. To enable plots: `pip install matplotlib`
+
+
 
 ## Project Structure
 
