@@ -7,25 +7,6 @@ A/B experimentation framework for LLM training techniques on micro-scale models.
 I created this project inspired by OpenAI's Parameter Golf Challenge to test different approaches and combinations, in order to easily identify what works and what doesn't. The code was written using a 3060 GPU with 12 GB of VRAM on Windows 11, but I believe it can be better adapted to other environments.
 
 
-## Quick Start
-
-```bash
-# Run all benchmarks
-python -m runner
-
-# Run specific benchmark
-python -m runner --bench optimizers
-
-# Quick test with 30 steps
-python -m runner --steps 30
-
-# List available options
-python -m runner --list
-
-# Generate copy-pasteable commands for batch runs
-python -m runner --commands --id myexperiment
-```
-
 ## Installation
 
 ### Prerequisites
