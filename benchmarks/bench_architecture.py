@@ -26,7 +26,7 @@ def run(
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
 
-    # 1. Define the pure baseline (turn everything OFF)
+    # Baseline with all architectural extras disabled
     base = replace(
         bench_cfg,
         mlp_activation="relu_sq",
@@ -39,12 +39,11 @@ def run(
         use_apb=False,
     )
 
-    # 2. Build the master list of variants
+    # Variant configurations
     variants: list[tuple[str, BenchmarkConfig]] = [
         ("arch_baseline", base),
-        # Activations
+        # Activations (baseline is relu_sq, so only list the alternatives)
         ("act_leaky_relu_sq", replace(base, mlp_activation="leaky_relu_sq")),
-        ("act_relu_sq", replace(base, mlp_activation="relu_sq")),
         ("act_gelu_sq", replace(base, mlp_activation="gelu_sq")),
         ("act_swiglu", replace(base, mlp_activation="swiglu")),
         # Residual Stream
@@ -75,15 +74,16 @@ def run(
     for name, cfg in variants:
         log(f"\n── Architecture: {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
-
-        if cfg.use_apb:
-            model.setup_apb(prune_frac=cfg.apb_prune_frac)
-
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
+
+            if cfg.use_apb:
+                model.setup_apb(prune_frac=cfg.apb_prune_frac)
+
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
 
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()

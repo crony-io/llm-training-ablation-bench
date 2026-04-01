@@ -17,11 +17,18 @@ _log_handle = None
 
 
 def init_log(path: Path) -> Path:
-    """Open the log file for writing. Returns the path for display."""
+    """Open the log file for writing. Returns the path for display.
+
+    Closes any previously opened handle to prevent file handle leaks on re-init.
+    """
     global _log_file, _log_handle
+    if _log_handle is not None:
+        _log_handle.flush()
+        _log_handle.close()
+        _log_handle = None
     path.parent.mkdir(parents=True, exist_ok=True)
     _log_file = path
-    _log_handle = open(path, "w", encoding="utf-8")  # noqa: SIM115
+    _log_handle = open(path, "w", encoding="utf-8")
     return path
 
 

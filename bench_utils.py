@@ -9,9 +9,12 @@ Targets <500MB VRAM so Windows desktop + browser stay responsive.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
@@ -20,10 +23,8 @@ from torch import Tensor, nn
 from config import BenchmarkConfig, TinyModelConfig
 from logger import log
 
-import copy
-
 # Global cache to store benchmark results for identical configurations
-_BENCHMARK_CACHE = {}
+_BENCHMARK_CACHE: dict[str, BenchmarkResult] = {}
 # ── Results ────────────────────────────────────────────────────────────────────
 
 
@@ -42,6 +43,7 @@ class BenchmarkResult:
     total_params: int
     loss_curve: list[float]
     extra: dict | None = None
+    cached: bool = False
 
     def summary_line(self) -> str:
         return (
@@ -57,8 +59,8 @@ class BenchmarkResult:
             "variant": self.variant,
             "model_config": self.model_config,
             "train_steps": self.train_steps,
-            "final_loss": self.final_loss,
-            "best_loss": self.best_loss,
+            "final_loss": round(self.final_loss, 4),
+            "best_loss": round(self.best_loss, 4),
             "avg_step_ms": round(self.avg_step_ms, 2),
             "peak_vram_mb": round(self.peak_vram_mb, 1),
             "total_params": self.total_params,
@@ -91,7 +93,10 @@ class SyntheticTokenLoader:
             generator=self.gen,
             device=self.device,
         )
-        tokens = torch.stack([self.pattern[s : s + seq_len + 1] for s in starts])
+        # Vectorized gather: build index matrix [batch_size, seq_len+1] without Python loop
+        offsets = torch.arange(seq_len + 1, device=self.device).unsqueeze(0)  # (1, seq_len+1)
+        indices = starts.unsqueeze(1) + offsets  # (batch_size, seq_len+1)
+        tokens = self.pattern[indices]
         return tokens[:, :-1], tokens[:, 1:]
 
 
@@ -138,7 +143,7 @@ class Rotary(nn.Module):
         super().__init__()
         self.dim = dim
         self.base = base
-        # Precompute frequencies in float32 for numerical stability [4]
+        # Precompute frequencies in float32 for numerical stability
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -166,7 +171,7 @@ class Rotary(nn.Module):
         if offset + T > self.cos_cached.size(2):
             self._update_cos_sin_cache(offset + T)
 
-        # --- FIX: Select the relevant slice from the cache ---
+        # Select the relevant slice from the precomputed cache
         cos = self.cos_cached[:, :, offset : offset + T, :]
         sin = self.sin_cached[:, :, offset : offset + T, :]
 
@@ -349,6 +354,9 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=causal_mask, scale=1.0
             )
+            # Learnable gate modulates XSA contribution (sigmoid(0)=0.5 at init).
+            # Matches the apb_gate pattern in Block.forward for consistency.
+            y = y * torch.sigmoid(self.xsa_gate.to(dtype=y.dtype))
         else:
             # QK-Norm produces unit vectors whose dot product is in [-1, 1].
             # SDPA natively divides by sqrt(head_dim), which squashes logits to ~±0.125
@@ -382,7 +390,7 @@ class MLP(nn.Module):
             return self.c_proj(F.gelu(self.c_fc(x)).square())
         elif self.activation == "swiglu":
             return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
-        return self.c_proj(F.leaky_relu(self.c_fc(x), 0.5).square())
+        raise ValueError(f"Unknown MLP activation: {self.activation!r}")
 
 
 class SmearGate(nn.Module):
@@ -408,6 +416,7 @@ class Block(nn.Module):
         activation: str = "leaky_relu_sq",
         use_residual_mix: bool = False,
         use_per_dim_scale: bool = False,
+        use_apb: bool = False,
     ):
         super().__init__()
         self.use_residual_mix = use_residual_mix
@@ -432,7 +441,7 @@ class Block(nn.Module):
             self.mlp_scale = nn.Parameter(
                 torch.ones(cfg.model_dim, dtype=torch.float32)
             )
-        if hasattr(cfg, "use_apb") and cfg.use_apb:
+        if use_apb:
             self.apb_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
@@ -451,6 +460,9 @@ class Block(nn.Module):
         mlp_out = self.mlp(self.mlp_norm(x) * s)
         if self.use_per_dim_scale:
             mlp_out = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        # APB gate: learned sigmoid gate modulates MLP contribution when APB is active
+        if hasattr(self, "apb_gate"):
+            mlp_out = mlp_out * torch.sigmoid(self.apb_gate.to(dtype=x.dtype))
         x = x + mlp_out
         return x
 
@@ -485,6 +497,8 @@ class TinyGPT(nn.Module):
         self.ve_shared = None
         self.ve_layer_set = ve_layers
         self.ve_layer_projs = nn.ModuleList()
+        # Pre-build {layer_idx: proj_idx} map to avoid O(n²) sorted lookup every forward
+        self.ve_layer_to_proj: dict[int, int] = {}
         if ve_layers:
             kv_dim = model_cfg.num_kv_heads * (
                 model_cfg.model_dim // model_cfg.num_heads
@@ -492,8 +506,9 @@ class TinyGPT(nn.Module):
             self.ve_shared = ValueEmbedding(
                 model_cfg.vocab_size, bench_cfg.ve_dim, kv_dim
             )
-            for _ in sorted(ve_layers):
+            for proj_idx, layer_idx in enumerate(sorted(ve_layers)):
                 self.ve_layer_projs.append(CastedLinear(kv_dim, kv_dim, bias=False))
+                self.ve_layer_to_proj[layer_idx] = proj_idx
 
         self.use_unet = bench_cfg.use_unet
         if self.use_unet:
@@ -524,6 +539,7 @@ class TinyGPT(nn.Module):
                     activation=bench_cfg.mlp_activation,
                     use_residual_mix=bench_cfg.use_residual_mix,
                     use_per_dim_scale=bench_cfg.use_per_dim_scale,
+                    use_apb=bench_cfg.use_apb,
                 )
                 for i in range(model_cfg.num_layers)
             ]
@@ -554,14 +570,14 @@ class TinyGPT(nn.Module):
             skips = []
             for i in range(self.num_encoder_layers):
                 ve = (
-                    self.ve_layer_projs[sorted(self.ve_layer_set).index(i)](ve_cache)
-                    if ve_cache is not None and i in self.ve_layer_set
+                    self.ve_layer_projs[self.ve_layer_to_proj[i]](ve_cache)
+                    if ve_cache is not None and i in self.ve_layer_to_proj
                     else None
                 )
                 x = self.blocks[i](x, x0=x0, v_embed=ve)
                 if (
                     i < self.num_encoder_layers - 1
-                ):  # Fix: stop pops one layer early to form bottleneck
+                ):  # Stop one layer early to form the U-Net bottleneck
                     skips.append(x)
             for i in range(self.num_decoder_layers):
                 bi = self.num_encoder_layers + i
@@ -571,16 +587,16 @@ class TinyGPT(nn.Module):
                     x = x + self.skip_norms[i](self.skip_projections[i](skip_val))
                 # Decoder block bi=num_encoder_layers+i must use the absolute index bi.
                 ve = (
-                    self.ve_layer_projs[sorted(self.ve_layer_set).index(bi)](ve_cache)
-                    if ve_cache is not None and bi in self.ve_layer_set
+                    self.ve_layer_projs[self.ve_layer_to_proj[bi]](ve_cache)
+                    if ve_cache is not None and bi in self.ve_layer_to_proj
                     else None
                 )
                 x = self.blocks[bi](x, x0=x0, v_embed=ve)
         else:
             for i, block in enumerate(self.blocks):
                 ve = (
-                    self.ve_layer_projs[sorted(self.ve_layer_set).index(i)](ve_cache)
-                    if ve_cache is not None and i in self.ve_layer_set
+                    self.ve_layer_projs[self.ve_layer_to_proj[i]](ve_cache)
+                    if ve_cache is not None and i in self.ve_layer_to_proj
                     else None
                 )
                 x = block(x, x0=x0, v_embed=ve)
@@ -592,11 +608,9 @@ class TinyGPT(nn.Module):
         else:
             logits = F.linear(x, self.embed.weight)
 
-        if (model_cfg := self.cfg) and getattr(
-            model_cfg, "logit_softcap", 0
-        ) > 0:  # Fix: avoid NaN crash div-by-zero
-            logits = model_cfg.logit_softcap * torch.tanh(
-                logits / model_cfg.logit_softcap
+        if self.cfg.logit_softcap > 0:
+            logits = self.cfg.logit_softcap * torch.tanh(
+                logits / self.cfg.logit_softcap
             )
 
         if target_ids is not None:
@@ -622,7 +636,7 @@ class TinyGPT(nn.Module):
             if isinstance(module, CastedLinear):
                 if ".mlp." in name:
                     module._qat_clip = cfg.qat_clip_mlp
-                elif ".attn." in name or name.endswith(".proj"):
+                elif ".attn." in name:
                     module._qat_clip = cfg.qat_clip_attn
 
     def param_count(self) -> int:
@@ -673,6 +687,54 @@ class Muon(torch.optim.Optimizer):
             ),
         )
 
+    def _momentum_and_vs(
+        self, g: Tensor, state: dict, momentum: float, nesterov: bool, vs_beta2: float
+    ) -> tuple[Tensor, Tensor]:
+        """Shared momentum buffer update + optional variance scaling.
+
+        Returns:
+            (processed_gradient, momentum_buffer)
+        """
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+        buf = state["momentum_buffer"]
+        buf.mul_(momentum).add_(g)
+
+        if nesterov:
+            g = g.add(buf, alpha=momentum)
+
+        if vs_beta2 > 0:
+            if "vs_v" not in state:
+                state["vs_v"] = torch.zeros_like(g)
+            state["vs_v"].mul_(vs_beta2).addcmul_(g, g, value=1 - vs_beta2)
+            g = g / (state["vs_v"].sqrt() + 1e-8)
+
+        return g, buf
+
+    @staticmethod
+    def _newton_schulz_and_scale(g: Tensor, backend_steps: int) -> Tensor:
+        """Newton-Schulz orthogonalization + rectangular scaling."""
+        g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+        return g
+
+    @staticmethod
+    def _apply_weight_decay(
+        p: Tensor, lr: float, wd: float, huber_delta: float
+    ) -> None:
+        """Apply Huber or standard L2 weight decay in-place."""
+        if wd > 0:
+            if huber_delta > 0:
+                abs_p = p.data.abs()
+                decay_grad = torch.where(
+                    abs_p <= huber_delta,
+                    p.data,
+                    huber_delta * p.data.sign(),
+                )
+                p.data.add_(decay_grad, alpha=-lr * wd)
+            else:
+                p.data.mul_(1 - lr * wd)
+
     @torch.no_grad()
     def step(self, closure=None):
         for group in self.param_groups:
@@ -687,40 +749,12 @@ class Muon(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
                 state = self.state[p]
-
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-
-                # Muon-VS: Variance Scaling should be careful not to destroy spectral info.
-                if vs_beta2 > 0:
-                    if "vs_v" not in state:
-                        state["vs_v"] = torch.zeros_like(g)
-                    state["vs_v"].mul_(vs_beta2).addcmul_(g, g, value=1 - vs_beta2)
-                    g = g / (state["vs_v"].sqrt() + 1e-8)
-
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-
-                # Weight decay: Huber or standard L2.
-                if wd > 0:
-                    if huber_delta > 0:
-                        abs_p = p.data.abs()
-                        decay_grad = torch.where(
-                            abs_p <= huber_delta,
-                            p.data,
-                            huber_delta * p.data.sign(),
-                        )
-                        p.data.add_(decay_grad, alpha=-lr * wd)
-                    else:
-                        p.data.mul_(1 - lr * wd)
-
+                g, _buf = self._momentum_and_vs(
+                    p.grad, state, momentum, nesterov, vs_beta2
+                )
+                g = self._newton_schulz_and_scale(g, backend_steps)
+                self._apply_weight_decay(p, lr, wd, huber_delta)
                 p.data.add_(g.to(p.dtype), alpha=-lr)
 
 
@@ -809,8 +843,13 @@ class Mano(torch.optim.Optimizer):
 # ── Magma Alignment Damping Wrapper ────────────────────────────────────────────
 
 
-class MagmaMuon(torch.optim.Optimizer):
-    """Muon + Magma: momentum-gradient alignment damping after Newton-Schulz."""
+class MagmaMuon(Muon):
+    """Muon + Magma: momentum-gradient alignment damping after Newton-Schulz.
+
+    Inherits momentum/VS/Newton-Schulz/weight-decay from Muon and adds
+    per-parameter alignment damping between the momentum buffer and the
+    current gradient.
+    """
 
     def __init__(
         self,
@@ -827,17 +866,37 @@ class MagmaMuon(torch.optim.Optimizer):
     ):
         super().__init__(
             params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                nesterov=nesterov,
-                weight_decay=weight_decay,
-                huber_delta=huber_delta,
-                vs_beta2=vs_beta2,
-                magma_tau=magma_tau,
-                magma_ema_decay=magma_ema_decay,
-            ),
+            lr=lr,
+            momentum=momentum,
+            backend_steps=backend_steps,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            huber_delta=huber_delta,
+            vs_beta2=vs_beta2,
+        )
+        # Inject Magma-specific hyperparams into every group.
+        for group in self.param_groups:
+            group.setdefault("magma_tau", magma_tau)
+            group.setdefault("magma_ema_decay", magma_ema_decay)
+
+    @staticmethod
+    def _compute_magma_score(
+        g: Tensor, buf: Tensor, state: dict, magma_tau: float, magma_ema_decay: float
+    ) -> None:
+        """Update the EMA alignment damping score in-place."""
+        if "magma_score" not in state:
+            state["magma_score"] = torch.ones(1, device=g.device)
+        # Row-wise alignment prevents Magma from being diluted by high dimensions.
+        if g.ndim == 2:
+            cos_sim = (buf * g).sum(dim=1) / (
+                buf.norm(dim=1) * g.norm(dim=1) + 1e-8
+            )
+            raw_score = torch.sigmoid(cos_sim / magma_tau).mean()
+        else:
+            cos_sim = (buf * g).sum() / (buf.norm() * g.norm() + 1e-8)
+            raw_score = torch.sigmoid(cos_sim / magma_tau)
+        state["magma_score"].mul_(magma_ema_decay).add_(
+            raw_score, alpha=(1.0 - magma_ema_decay)
         )
 
     @torch.no_grad()
@@ -856,57 +915,25 @@ class MagmaMuon(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
                 state = self.state[p]
 
+                # Magma alignment score must be computed BEFORE momentum update
+                # so the buffer still holds the previous step's momentum.
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                    state["magma_score"] = torch.ones(1, device=p.device)
-                buf = state["momentum_buffer"]
-
-                # Row-wise alignment calculation prevents Magma from being diluted by high dimensions
-                if g.ndim == 2:
-                    cos_sim = (buf * g).sum(dim=1) / (
-                        buf.norm(dim=1) * g.norm(dim=1) + 1e-8
-                    )
-                    raw_score = torch.sigmoid(cos_sim / magma_tau).mean()
-                else:
-                    cos_sim = (buf * g).sum() / (buf.norm() * g.norm() + 1e-8)
-                    raw_score = torch.sigmoid(cos_sim / magma_tau)
-
-                state["magma_score"].mul_(magma_ema_decay).add_(
-                    raw_score, alpha=(1.0 - magma_ema_decay)
+                    state["momentum_buffer"] = torch.zeros_like(p.grad)
+                self._compute_magma_score(
+                    p.grad, state["momentum_buffer"], state, magma_tau, magma_ema_decay
                 )
 
-                buf.mul_(momentum).add_(g)
+                g, _buf = self._momentum_and_vs(
+                    p.grad, state, momentum, nesterov, vs_beta2
+                )
+                g = self._newton_schulz_and_scale(g, backend_steps)
 
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-
-                if vs_beta2 > 0:
-                    if "vs_v" not in state:
-                        state["vs_v"] = torch.zeros_like(g)
-                    state["vs_v"].mul_(vs_beta2).addcmul_(g, g, value=1 - vs_beta2)
-                    g = g / (state["vs_v"].sqrt() + 1e-8)
-
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-
-                # Apply Magma damping.
+                # Apply Magma damping after Newton-Schulz.
                 g = g * state["magma_score"]
 
-                if wd > 0:
-                    if huber_delta > 0:
-                        abs_p = p.data.abs()
-                        decay_grad = torch.where(
-                            abs_p <= huber_delta,
-                            p.data,
-                            huber_delta * p.data.sign(),
-                        )
-                        p.data.add_(decay_grad, alpha=-lr * wd)
-                    else:
-                        p.data.mul_(1 - lr * wd)
-
+                self._apply_weight_decay(p, lr, wd, huber_delta)
                 p.data.add_(g.to(p.dtype), alpha=-lr)
 
 
@@ -919,12 +946,12 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     if t32.ndim < 2:
         amax = t32.abs().max().item()
         scale = torch.tensor(
-            amax / clip_range if amax > 0 else 1.0, dtype=torch.float16
+            amax / clip_range if amax > 0 else 1.0, dtype=torch.float32
         )
-        q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(
+        q = torch.clamp(torch.round(t32 / scale), -clip_range, clip_range).to(
             torch.int8
         )
-        return q, scale
+        return q, scale.to(torch.float16)
 
     best_s, best_err = None, float("inf")
     for pct in [0.9995, 0.9999, 1.0]:
@@ -933,17 +960,19 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
             if pct < 1.0
             else t32.abs().amax(dim=1)
         )
-        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        # Keep scale in float32 during search to avoid precision loss in MSE comparison
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range)
         q_test = torch.clamp(
-            torch.round(t32 / s.float()[:, None]), -clip_range, clip_range
+            torch.round(t32 / s[:, None]), -clip_range, clip_range
         )
-        err = (t32 - q_test * s.float()[:, None]).pow(2).mean().item()
+        err = (t32 - q_test * s[:, None]).pow(2).mean().item()
         if err < best_err:
             best_s, best_err = s, err
     q = torch.clamp(
-        torch.round(t32 / best_s.float()[:, None]), -clip_range, clip_range
+        torch.round(t32 / best_s[:, None]), -clip_range, clip_range
     ).to(torch.int8)
-    return q, best_s
+    # Cast to float16 only after the best scale is selected
+    return q, best_s.to(torch.float16)
 
 
 def gptq_quantize(
@@ -977,14 +1006,15 @@ def gptq_quantize(
         row_clip = (
             torch.quantile(W.abs(), pct, dim=1) if pct < 1.0 else W.abs().amax(dim=1)
         )
-        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        # Keep scale in float32 during search to avoid precision loss in MSE comparison
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range)
         q_test = torch.clamp(
-            torch.round(W / s.float()[:, None]), -clip_range, clip_range
+            torch.round(W / s[:, None]), -clip_range, clip_range
         )
-        err = (W - q_test * s.float()[:, None]).pow(2).mean().item()
+        err = (W - q_test * s[:, None]).pow(2).mean().item()
         if err < best_err:
             best_s, best_err = s, err
-    scale = best_s.float()
+    scale = best_s
     Q = torch.zeros_like(W)
 
     for col_start in range(0, cols, blocksize):
@@ -1000,7 +1030,7 @@ def gptq_quantize(
             q_col = torch.clamp(torch.round(w_col / scale[:]), -clip_range, clip_range)
             Q[:, col_j] = q_col
 
-            # It MUST be (Quantized - True) so subtracting it later cancels the error out!
+            # Error direction is (quantized - original) so subsequent compensation cancels it
             quantized_val = q_col * scale[:]
             err_col = (quantized_val - w_col) / d
 
@@ -1014,7 +1044,8 @@ def gptq_quantize(
         if col_end < cols:
             W[:, col_end:] -= block_Err @ Hinv[col_start:col_end, col_end:]
 
-    return Q.to(torch.int8), best_s
+    # Cast to float16 only after the best scale is selected and GPTQ error compensation is done
+    return Q.to(torch.int8), best_s.to(torch.float16)
 
 
 def measure_quant_error(weight: Tensor, q: Tensor, scale: Tensor) -> float:
@@ -1058,6 +1089,35 @@ def compute_momentum(step: int, bench_cfg: BenchmarkConfig) -> float:
     return bench_cfg.muon_momentum
 
 
+# ── Training Loop Helpers ──────────────────────────────────────────────────────
+
+
+def _group_grad_norm(params: list[Tensor]) -> float:
+    """Compute L2 gradient norm for a parameter group."""
+    sq_sum = 0.0
+    any_seen = False
+    for p in params:
+        g = p.grad
+        if g is None:
+            continue
+        any_seen = True
+        sq_sum += g.detach().float().pow(2).sum().item()
+    if not any_seen:
+        return 0.0
+    return math.sqrt(sq_sum)
+
+
+def _upd_ratio(params: list[Tensor], pre_clones: list[Tensor]) -> float:
+    """Compute relative update magnitude: ||delta|| / ||weights||."""
+    if not params:
+        return 0.0
+    delta_sq = sum(
+        (p - pre_p).pow(2).sum().item() for p, pre_p in zip(params, pre_clones)
+    )
+    w_sq = sum(p.pow(2).sum().item() for p in params)
+    return math.sqrt(delta_sq) / (math.sqrt(w_sq) + 1e-8) if w_sq > 0 else 0.0
+
+
 # ── Training Loop ──────────────────────────────────────────────────────────────
 
 
@@ -1067,22 +1127,29 @@ def run_micro_train(
     bench_cfg: BenchmarkConfig,
     device: torch.device,
     label: str = "baseline",
+    skip_cache: bool = False,
 ) -> BenchmarkResult:
-    """Run a tiny training loop and collect metrics. Returns BenchmarkResult."""
+    """Run a tiny training loop and collect metrics. Returns BenchmarkResult.
 
-    # --- CACHE CHECK ---
+    Args:
+        skip_cache: If True, bypass the result cache (useful when the caller
+            needs trained weights rather than just metrics, e.g. PTQ).
+    """
+
     global _BENCHMARK_CACHE
-    cfg_state = str(model_cfg.__dict__) + str(bench_cfg.__dict__)
-    cfg_hash = hash(cfg_state)
+    cfg_key = json.dumps(
+        {"model": asdict(model_cfg), "bench": asdict(bench_cfg)}, sort_keys=True
+    )
+    cfg_hash = hashlib.sha256(cfg_key.encode()).hexdigest()
 
-    if cfg_hash in _BENCHMARK_CACHE:
+    if not skip_cache and cfg_hash in _BENCHMARK_CACHE:
         log(f"  [{label}] Using cached baseline result! (Skipping redundant compute)")
         # Deepcopy to avoid mutating the cached object's label
         cached_res = copy.deepcopy(_BENCHMARK_CACHE[cfg_hash])
         cached_res.name = label
         cached_res.variant = label
+        cached_res.cached = True
         return cached_res
-    # ----------------------
 
     torch.manual_seed(bench_cfg.seed)
     model.setup_qat()
@@ -1181,6 +1248,9 @@ def run_micro_train(
 
     loss_curve: list[float] = []
     best_loss = float("inf")
+    last_shadow_loss = None
+    # Build once before the loop — contents never change between steps.
+    params_all = matrix_params + scalar_params + embed_param_tensors
 
     model.train()
     torch.cuda.synchronize(device)
@@ -1233,73 +1303,35 @@ def run_micro_train(
 
         loss.backward()
 
-        def _group_grad_norm(params: list[Tensor]) -> float:
-            sq_sum = 0.0
-            any_seen = False
-            for p in params:
-                g = p.grad
-                if g is None:
-                    continue
-                any_seen = True
-                sq_sum += g.detach().float().pow(2).sum().item()
-            if not any_seen:
-                return 0.0
-            return math.sqrt(sq_sum)
+        is_last_step = step == bench_cfg.train_steps - 1
+        is_log_step = (bench_cfg.log_every > 0 and (step + 1) % bench_cfg.log_every == 0) or is_last_step
 
-        grad_norm_matrix = _group_grad_norm(matrix_params)
-        grad_norm_scalar = _group_grad_norm(scalar_params)
-        grad_norm_embed = _group_grad_norm(embed_param_tensors)
+        # Compute per-group gradient norms only on log steps to avoid overhead
+        if is_log_step:
+            grad_norm_matrix = _group_grad_norm(matrix_params)
+            grad_norm_scalar = _group_grad_norm(scalar_params)
+            grad_norm_embed = _group_grad_norm(embed_param_tensors)
+            grad_norm = math.sqrt(
+                grad_norm_matrix**2 + grad_norm_scalar**2 + grad_norm_embed**2
+            )
 
-        # Calculate true overall norm before clip for accurate logging
-        total_grad_norm = math.sqrt(
-            grad_norm_matrix**2 + grad_norm_scalar**2 + grad_norm_embed**2
-        )
-        grad_norm = total_grad_norm
-
-        # Fix: Placebo clipping! Matrix optimizer normalization erases the global scalar clip scale.
-        # We selectively apply the clip only to non-matrix parameters that are vulnerable to exploding gradients
+        # Apply gradient clipping to non-matrix params when a finite clip norm is set
         if bench_cfg.grad_clip_norm > 0:
             params_to_clip = scalar_params + embed_param_tensors
             if params_to_clip:
                 torch.nn.utils.clip_grad_norm_(params_to_clip, bench_cfg.grad_clip_norm)
-        else:
-            params_to_clip = scalar_params + embed_param_tensors
-            if params_to_clip:
-                torch.nn.utils.clip_grad_norm_(params_to_clip, float("inf"))
 
-        is_log_step = bench_cfg.log_every > 0 and (step + 1) % bench_cfg.log_every == 0
-        pre_matrix = [p.detach().clone() for p in matrix_params] if is_log_step else []
-        pre_scalar = [p.detach().clone() for p in scalar_params] if is_log_step else []
-        pre_embed = (
-            [p.detach().clone() for p in embed_param_tensors] if is_log_step else []
-        )
-        params_all = matrix_params + scalar_params + embed_param_tensors
+        # Snapshot all params before optimizer step to compute update ratios
         pre_all = [p.detach().clone() for p in params_all] if is_log_step else []
 
         for opt in optimizers:
             opt.step()
 
         if is_log_step:
-
-            def _upd_ratio(params: list[Tensor], pre_clones: list[Tensor]) -> float:
-                if not params:
-                    return 0.0
-                delta_sq = sum(
-                    (p - pre_p).pow(2).sum().item()
-                    for p, pre_p in zip(params, pre_clones)
-                )
-                w_sq = sum(p.pow(2).sum().item() for p in params)
-                return (
-                    math.sqrt(delta_sq) / (math.sqrt(w_sq) + 1e-8) if w_sq > 0 else 0.0
-                )
-
-            upd_ratio_matrix = _upd_ratio(matrix_params, pre_matrix)
-            upd_ratio_scalar = _upd_ratio(scalar_params, pre_scalar)
-            upd_ratio_embed = _upd_ratio(embed_param_tensors, pre_embed)
-            upd_ratio_all = _upd_ratio(params_all, pre_all)
-
-            # Keep legacy name but make it more informative: overall update ratio.
-            upd_ratio = upd_ratio_all
+            upd_ratio_matrix = _upd_ratio(matrix_params, pre_all[:len(matrix_params)])
+            upd_ratio_scalar = _upd_ratio(scalar_params, pre_all[len(matrix_params):len(matrix_params) + len(scalar_params)])
+            upd_ratio_embed = _upd_ratio(embed_param_tensors, pre_all[len(matrix_params) + len(scalar_params):])
+            upd_ratio = _upd_ratio(params_all, pre_all)
 
         # EMA update.
         if ema_state is not None:
@@ -1309,12 +1341,11 @@ def run_micro_train(
                         t.detach().float(), alpha=1.0 - bench_cfg.ema_decay
                     )
 
-        # SWA update.
+        # SWA update (uses pre-computed swa_start_step_global).
         if sma_state is not None:
-            swa_start_step = int(bench_cfg.train_steps * bench_cfg.swa_start_frac)
             if (
-                step >= swa_start_step
-                and (step - swa_start_step) % bench_cfg.swa_every == 0
+                step >= swa_start_step_global
+                and (step - swa_start_step_global) % bench_cfg.swa_every == 0
             ):
                 with torch.no_grad():
                     for name, t in model.state_dict().items():
@@ -1323,49 +1354,51 @@ def run_micro_train(
 
         loss_val = loss.item()
 
-        # Track both active loss and variant loss for the logs.
+        # Shadow model evaluation: only run the expensive state-dict swap + forward
+        # pass on log steps. EMA/SWA accumulation above still runs every step.
         shadow_loss = None
         shadow_str = ""
 
-        # Use an independent batch to correctly evaluate shadow models
-        if (ema_state is not None) or (sma_state is not None and sma_count > 0):
-            shadow_x, shadow_y = val_loader.next_batch(bs, model_cfg.seq_len)
+        if is_log_step:
+            has_shadow = (ema_state is not None) or (sma_state is not None and sma_count > 0)
+            if has_shadow:
+                shadow_x, shadow_y = val_loader.next_batch(bs, model_cfg.seq_len)
 
-        if ema_state is not None:
-            with torch.no_grad():
-                orig_state = {
-                    n: t.detach().clone() for n, t in model.state_dict().items()
-                }
-                # Evaluate in native mixed bfloat16 alignment instead of float32
-                model.load_state_dict({n: t.bfloat16() for n, t in ema_state.items()})
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16, enabled=True
-                ):
-                    shadow_loss = model(shadow_x, shadow_y).item()
-                # Restore without re-binding Parameters (keeps optimizer refs valid).
-                model.load_state_dict(orig_state)
-                shadow_str = f" (Shadow: {shadow_loss:.5f})"
-        elif sma_state is not None and sma_count > 0:
-            with torch.no_grad():
-                orig_state = {
-                    n: t.detach().clone() for n, t in model.state_dict().items()
-                }
-                avg_state = {
-                    n: (t / sma_count).bfloat16() for n, t in sma_state.items()
-                }
-                model.load_state_dict(avg_state)
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16, enabled=True
-                ):
-                    shadow_loss = model(shadow_x, shadow_y).item()
-                model.load_state_dict(orig_state)
-                shadow_str = f" (Shadow: {shadow_loss:.5f})"
+            if ema_state is not None:
+                with torch.no_grad():
+                    orig_state = {
+                        n: t.detach().clone() for n, t in model.state_dict().items()
+                    }
+                    model.load_state_dict({n: t.bfloat16() for n, t in ema_state.items()})
+                    with torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16, enabled=True
+                    ):
+                        shadow_loss = model(shadow_x, shadow_y).item()
+                    model.load_state_dict(orig_state)
+                    shadow_str = f" (Shadow: {shadow_loss:.5f})"
+                    last_shadow_loss = shadow_loss
+            elif sma_state is not None and sma_count > 0:
+                with torch.no_grad():
+                    orig_state = {
+                        n: t.detach().clone() for n, t in model.state_dict().items()
+                    }
+                    avg_state = {
+                        n: (t / sma_count).bfloat16() for n, t in sma_state.items()
+                    }
+                    model.load_state_dict(avg_state)
+                    with torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16, enabled=True
+                    ):
+                        shadow_loss = model(shadow_x, shadow_y).item()
+                    model.load_state_dict(orig_state)
+                    shadow_str = f" (Shadow: {shadow_loss:.5f})"
+                    last_shadow_loss = shadow_loss
 
-        # We keep the variant loss in the curve if it exists so benchmarks track the tested technique.
-        record_loss = shadow_loss if shadow_loss is not None else loss_val
-        loss_curve.append(record_loss)
-        if record_loss < best_loss:
-            best_loss = record_loss
+        # Always record training loss for a consistent curve.
+        # Shadow loss is tracked separately for logging only.
+        loss_curve.append(loss_val)
+        if loss_val < best_loss:
+            best_loss = loss_val
 
         if is_log_step:
             val_x, val_y = val_loader.next_batch(8, model_cfg.seq_len)
@@ -1382,6 +1415,15 @@ def run_micro_train(
             )
 
     final_loss_val = loss_curve[-1] if loss_curve else float("nan")
+
+    # Use the shadow loss from the last log step (guaranteed by is_last_step)
+    # instead of a redundant post-training eval on a new random batch.
+    # This is consistent with the in-training shadow metrics and avoids
+    # high variance from single-batch evaluation on synthetic data.
+    if last_shadow_loss is not None:
+        final_loss_val = last_shadow_loss
+        if last_shadow_loss < best_loss:
+            best_loss = last_shadow_loss
 
     torch.cuda.synchronize(device)
     elapsed_ms = 1000.0 * (time.perf_counter() - t0)
@@ -1400,8 +1442,6 @@ def run_micro_train(
         loss_curve=loss_curve,
     )
 
-    # --- CACHE SAVE ---
     _BENCHMARK_CACHE[cfg_hash] = copy.deepcopy(res)
-    # ---------------------
 
     return res

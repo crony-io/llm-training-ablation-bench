@@ -27,7 +27,8 @@ from pathlib import Path
 import torch
 
 from bench_utils import BenchmarkResult
-from config import ALL_MODEL_CONFIGS, DEFAULT_MODEL, BenchmarkConfig
+from config import ALL_MODEL_CONFIGS, DEFAULT_MODEL, BenchmarkConfig, TinyModelConfig
+from cuda_memory import configure_cuda_memory, log_cuda_memory_config
 from logger import close_log, init_log, log
 
 
@@ -44,6 +45,58 @@ AVAILABLE_BENCHMARKS = {
     "embeddings": "benchmarks.bench_embeddings",
     "quantization": "benchmarks.bench_quantization",
 }
+
+
+# ── Param Estimation ──────────────────────────────────────────────────────────
+
+
+def estimate_param_count(
+    model_cfg: TinyModelConfig,
+    mlp_activation: str = "relu_sq",
+) -> int:
+    """Estimate total trainable parameters for a model + benchmark config pair.
+
+    Covers the base model architecture (embedding, attention, MLP, norms,
+    per-head gain). Optional technique modules (SmearGate, U-Net skips,
+    BigramHash, ValueEmbedding, etc.) are excluded since they depend on
+    BenchmarkConfig toggles — the actual count from model.param_count()
+    is used in BenchmarkResult for precise reporting.
+
+    Args:
+        model_cfg: Model architecture configuration.
+        mlp_activation: MLP activation name from BenchmarkConfig (determines
+            whether SwiGLU's 3-matrix MLP is used).
+
+    Returns:
+        Estimated total parameter count.
+    """
+    head_dim = model_cfg.model_dim // model_cfg.num_heads
+    mlp_hidden = int(model_cfg.model_dim * model_cfg.mlp_mult)
+    embed_params = model_cfg.vocab_size * model_cfg.model_dim
+    head_params = (
+        0 if model_cfg.tie_embeddings else (model_cfg.vocab_size * model_cfg.model_dim)
+    )
+    # Attention: Q + K (GQA) + V (GQA) + output projection
+    attn_params = model_cfg.model_dim * (
+        model_cfg.num_heads * head_dim
+        + model_cfg.num_kv_heads * head_dim
+        + model_cfg.num_kv_heads * head_dim
+        + model_cfg.num_heads * head_dim
+    )
+    # Per-head learned temperature (q_gain): num_heads per layer
+    attn_params += model_cfg.num_heads
+    # SwiGLU has 3 matrices (c_fc, c_gate, c_proj), others have 2
+    mlp_matrices = 3 if mlp_activation == "swiglu" else 2
+    mlp_params = mlp_matrices * mlp_hidden * model_cfg.model_dim
+    # RMSNorm scales: 2 per block (attn_norm + mlp_norm) + 1 final_norm
+    norm_params = model_cfg.model_dim if model_cfg.ln_scale else 0
+    per_block_norm = 2 * model_cfg.model_dim if model_cfg.ln_scale else 0
+    return (
+        embed_params
+        + head_params
+        + model_cfg.num_layers * (attn_params + mlp_params + per_block_norm)
+        + norm_params
+    )
 
 
 # ── Discovery ──────────────────────────────────────────────────────────────────
@@ -107,11 +160,17 @@ def _append_footer(results_path: Path, total_elapsed_s: float) -> None:
 
 
 def _load_results(results_path: Path) -> dict[str, list[dict]]:
-    """Read results JSONL, grouped by benchmark name."""
+    """Read results JSONL, grouped by benchmark name.
+
+    Silently skips malformed lines to stay robust against partial/corrupt files.
+    """
     grouped: dict[str, list[dict]] = {}
     with open(results_path, encoding="utf-8") as f:
         for line in f:
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if entry.get("_type") == "result":
                 bench = entry["benchmark"]
                 grouped.setdefault(bench, []).append(entry)
@@ -188,6 +247,12 @@ def main() -> None:
         help="Print copy-pasteable commands to run each benchmark separately with --id",
     )
     parser.add_argument(
+        "--vram-fraction",
+        type=float,
+        default=0.7,
+        help="Max fraction of GPU memory PyTorch may reserve (0=unlimited, default 0.7)",
+    )
+    parser.add_argument(
         "--list", action="store_true", help="List available benchmarks and models"
     )
     args = parser.parse_args()
@@ -199,27 +264,7 @@ def main() -> None:
             print(f"  - {name}")
         print("\nAvailable model configs:")
         for name, cfg in ALL_MODEL_CONFIGS.items():
-            head_dim = cfg.model_dim // cfg.num_heads
-            mlp_hidden = int(cfg.model_dim * cfg.mlp_mult)
-            embed_params = cfg.vocab_size * cfg.model_dim
-            head_params = (
-                0
-                if getattr(cfg, "tie_embeddings", False)
-                else (cfg.vocab_size * cfg.model_dim)
-            )
-            # Attention: Q proj + K proj (GQA-aware) + V proj (GQA-aware) + out proj
-            attn_params = cfg.model_dim * (
-                cfg.num_heads * head_dim  # Q
-                + cfg.num_kv_heads * head_dim  # K
-                + cfg.num_kv_heads * head_dim  # V
-                + cfg.num_heads * head_dim  # out
-            )
-            # MLP: SwiGLU has 3 matrices (c_fc, c_gate, c_proj), others have 2
-            mlp_matrices = 3 if getattr(cfg, "mlp_activation", "") == "swiglu" else 2
-            mlp_params = mlp_matrices * mlp_hidden * cfg.model_dim
-            est_params = (
-                embed_params + head_params + cfg.num_layers * (attn_params + mlp_params)
-            )
+            est_params = estimate_param_count(cfg)
             est_mb = est_params * 4 / (1024 * 1024)
             print(
                 f"  - {name}: {cfg.num_layers}L {cfg.model_dim}d {cfg.num_heads}h seq={cfg.seq_len} ~{est_params:,} params ~{est_mb:.1f}MB"
@@ -254,6 +299,10 @@ def main() -> None:
         sys.exit(1)
 
     device = torch.device("cuda", 0)
+
+    # Configure CUDA allocator BEFORE any tensor allocation.
+    cuda_settings = configure_cuda_memory(device, vram_fraction=args.vram_fraction)
+
     gpu_name = torch.cuda.get_device_name(device)
     gpu_mem_mb = torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
 
@@ -291,26 +340,7 @@ def main() -> None:
     _init_results_file(results_path, gpu_name, model_cfg.name, to_run, bench_cfg)
 
     # Now everything goes to both console and log file.
-    # Parameter Estimate formula accounts for Embeddings, Head, GQA and SwiGLU correctly.
-    head_dim = model_cfg.model_dim // model_cfg.num_heads
-    mlp_hidden = int(model_cfg.model_dim * model_cfg.mlp_mult)
-    embed_params = model_cfg.vocab_size * model_cfg.model_dim
-    head_params = (
-        0
-        if getattr(model_cfg, "tie_embeddings", False)
-        else (model_cfg.vocab_size * model_cfg.model_dim)
-    )
-    attn_params = model_cfg.model_dim * (
-        model_cfg.num_heads * head_dim
-        + model_cfg.num_kv_heads * head_dim
-        + model_cfg.num_kv_heads * head_dim
-        + model_cfg.num_heads * head_dim
-    )
-    mlp_matrices = 3 if getattr(model_cfg, "mlp_activation", "") == "swiglu" else 2
-    mlp_params = mlp_matrices * mlp_hidden * model_cfg.model_dim
-    est_params = (
-        embed_params + head_params + model_cfg.num_layers * (attn_params + mlp_params)
-    )
+    est_params = estimate_param_count(model_cfg, mlp_activation=bench_cfg.mlp_activation)
 
     log(f"\nGPU: {gpu_name} ({gpu_mem_mb:.0f} MB)")
     if gpu_mem_mb < 2048:
@@ -321,6 +351,7 @@ def main() -> None:
     log(
         f"Steps: {bench_cfg.train_steps}  Seed: {bench_cfg.seed}  Batch: {bench_cfg.batch_size}"
     )
+    log_cuda_memory_config(cuda_settings)
     log(f"Benchmarks: {', '.join(to_run)}")
     log(f"Results → {results_path}")
     log(f"Log     → {log_path}")
@@ -329,48 +360,49 @@ def main() -> None:
     # Run benchmarks — stream each result to disk as it completes.
     total_t0 = time.perf_counter()
 
-    for bench_name in to_run:
-        mod_path = available[bench_name]
+    try:
+        for bench_name in to_run:
+            mod_path = available[bench_name]
+            log(f"\n{'#' * 70}")
+            log(f"# Benchmark: {bench_name}")
+            log(f"{'#' * 70}")
+
+            mod = importlib.import_module(mod_path)
+            results = mod.run(device, model_cfg, bench_cfg)
+
+            # Stream to disk immediately, then discard from RAM.
+            result_dicts = []
+            for r in results:
+                d = r.to_dict()
+                _append_result(results_path, bench_name, r)
+                result_dicts.append(d)
+
+            # Log table from dicts (no BenchmarkResult objects kept).
+            _print_table_from_dicts(result_dicts, title=f"Benchmark: {bench_name}")
+            del results, result_dicts
+            torch.cuda.empty_cache()
+
+        total_elapsed = time.perf_counter() - total_t0
+        _append_footer(results_path, total_elapsed)
+
+        # Final summary — read everything back from disk.
         log(f"\n{'#' * 70}")
-        log(f"# Benchmark: {bench_name}")
+        log(f"# SUMMARY ({total_elapsed:.1f}s total)")
         log(f"{'#' * 70}")
 
-        mod = importlib.import_module(mod_path)
-        results = mod.run(device, model_cfg, bench_cfg)
+        grouped = _load_results(results_path)
+        for bench_name, rows in grouped.items():
+            _print_table_from_dicts(rows, title=bench_name)
 
-        # Stream to disk immediately, then discard from RAM.
-        result_dicts = []
-        for r in results:
-            d = r.to_dict()
-            _append_result(results_path, bench_name, r)
-            result_dicts.append(d)
+        log(f"Results saved: {results_path}")
+        log(f"Log saved:     {log_path}")
+        log(f"Total time: {total_elapsed:.1f}s")
 
-        # Log table from dicts (no BenchmarkResult objects kept).
-        _print_table_from_dicts(result_dicts, title=f"Benchmark: {bench_name}")
-        del results, result_dicts
-        torch.cuda.empty_cache()
+        from plotter import plot_jsonl
 
-    total_elapsed = time.perf_counter() - total_t0
-    _append_footer(results_path, total_elapsed)
-
-    # Final summary — read everything back from disk.
-    log(f"\n{'#' * 70}")
-    log(f"# SUMMARY ({total_elapsed:.1f}s total)")
-    log(f"{'#' * 70}")
-
-    grouped = _load_results(results_path)
-    for bench_name, rows in grouped.items():
-        _print_table_from_dicts(rows, title=bench_name)
-
-    log(f"Results saved: {results_path}")
-    log(f"Log saved:     {log_path}")
-    log(f"Total time: {total_elapsed:.1f}s")
-
-    from plotter import plot_jsonl
-
-    plot_jsonl(results_path)
-
-    close_log()
+        plot_jsonl(results_path)
+    finally:
+        close_log()
 
 
 if __name__ == "__main__":

@@ -27,14 +27,14 @@ def run(
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
 
-    # 1. Define a strict baseline with no weight averaging
+    # Baseline with no weight averaging
     base = replace(
         bench_cfg,
         use_ema=False,
         use_swa=False,
     )
 
-    # 2. Build the master list of variants
+    # Variant configurations
     variants: list[tuple[str, BenchmarkConfig]] = [
         ("wa_baseline", base),
         # EMA variants
@@ -49,10 +49,11 @@ def run(
     for name, cfg in variants:
         log(f"\n── Weight Averaging: {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()

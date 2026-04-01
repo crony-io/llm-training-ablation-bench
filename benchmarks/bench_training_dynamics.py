@@ -37,7 +37,7 @@ def run(
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
 
-    # 1. Define the strict baseline (no warmups, flat dynamics)
+    # Baseline with no warmups and flat dynamics
     base = replace(
         bench_cfg,
         use_lr_warmup=False,
@@ -47,7 +47,7 @@ def run(
         use_batch_warmup=False,
     )
 
-    # 2. Build the master list of variants
+    # Variant configurations
     variants: list[tuple[str, BenchmarkConfig]] = [
         ("td_baseline", base),
         # LR Schedules (Assuming global lr_warmup_steps is 20)
@@ -118,10 +118,11 @@ def run(
     for name, cfg in variants:
         log(f"\n── Training Dynamics: {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()

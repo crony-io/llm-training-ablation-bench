@@ -26,14 +26,20 @@ def run(
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
 
-    # 1. Define a strict baseline with all embedding tricks disabled
+    # Baseline with all embedding enrichment disabled
     base = replace(
         bench_cfg,
         use_bigram_hash=False,
         use_value_embed=False,
     )
 
-    # 2. Build the master list of variants
+    # Compute VE layer indices dynamically so they target the last layers
+    # regardless of model depth (e.g. 2L, 3L, etc.).
+    n = model_cfg.num_layers
+    last_layer = str(n - 1)
+    last_two = ",".join(str(i) for i in range(max(0, n - 2), n))
+
+    # Variant configurations
     variants: list[tuple[str, BenchmarkConfig]] = [
         ("embed_baseline", base),
         # BigramHash
@@ -44,11 +50,11 @@ def run(
         # Value Embeddings
         (
             "ve_last_layer",
-            replace(base, use_value_embed=True, ve_dim=64, ve_layers="1"),
+            replace(base, use_value_embed=True, ve_dim=64, ve_layers=last_layer),
         ),
         (
             "ve_last_two",
-            replace(base, use_value_embed=True, ve_dim=64, ve_layers="0,1"),
+            replace(base, use_value_embed=True, ve_dim=64, ve_layers=last_two),
         ),
         # Synergy Test (The power of a consolidated suite!)
         (
@@ -60,7 +66,7 @@ def run(
                 bigram_dim=64,
                 use_value_embed=True,
                 ve_dim=64,
-                ve_layers="0,1",
+                ve_layers=last_two,
             ),
         ),
     ]
@@ -68,10 +74,11 @@ def run(
     for name, cfg in variants:
         log(f"\n── Embeddings: {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()

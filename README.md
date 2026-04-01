@@ -12,7 +12,7 @@ I created this project inspired by OpenAI's Parameter Golf Challenge to test dif
 ### Prerequisites
 
 - NVIDIA GPU with CUDA support
-- Python 3.8+
+- Python 3.10+
 
 ### Setup
 
@@ -82,6 +82,12 @@ python -m runner --steps 100
 # Custom run ID (prepended to timestamp)
 python -m runner --id experiment1
 
+# Limit GPU memory usage (default: 70% of total VRAM)
+python -m runner --vram-fraction 0.5
+
+# Disable VRAM cap (PyTorch default behavior)
+python -m runner --vram-fraction 0
+
 ```
 
 ### Batch Script Generation (--commands)
@@ -141,6 +147,7 @@ llm-training-ablation-bench/
 ├── config.py               # Model configs and BenchmarkConfig
 ├── bench_utils.py          # TinyGPT model, optimizers, training loop
 ├── runner.py               # Main benchmark orchestrator
+├── cuda_memory.py          # CUDA allocator tuning for lower VRAM overhead
 ├── logger.py               # Dual console/file logging
 ├── plotter.py              # Auto-chart generation
 └── requirements.txt        # Dependencies (torch, matplotlib)
@@ -277,7 +284,7 @@ Located in `bench_utils.py:run_micro_train()`:
    - SWA (Stochastic Weight Averaging)
    - QAT (Quantization-Aware Training via STE)
 
-4. **Caching**: Identical configs reuse cached results
+4. **Caching**: Identical configs reuse cached results (VRAM preserved from original run)
 
 ### Optimizers
 
@@ -385,11 +392,11 @@ def run(
     for name, cfg in variants:
         log(f"\n── YourCategory: {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
-
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()
@@ -432,19 +439,37 @@ Each run generates:
 
 ### Metrics Tracked
 
-- `final_loss` — Last training step loss
+- `final_loss` — Last training step loss (or shadow model loss for EMA/SWA variants)
 - `best_loss` — Best loss achieved
 - `avg_step_ms` — Average time per training step
 - `peak_vram_mb` — Peak GPU memory usage
 - `total_params` — Model parameter count
 - `loss_curve` — Full loss history
 
+## CUDA Memory Management
+
+The runner configures PyTorch's CUDA caching allocator to reduce VRAM overhead on consumer GPUs. By default, PyTorch aggressively reserves memory pools that are rarely released, causing Windows Task Manager to show near-100% GPU usage even when actual model footprint is tiny.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `--vram-fraction` | `0.7` | Caps PyTorch to 70% of total GPU VRAM |
+| `expandable_segments` | `True` | Grows allocations incrementally instead of large upfront blocks |
+| `garbage_collection_threshold` | `0.6` | Reclaims unused memory more aggressively |
+| `max_split_size_mb` | `128` | Limits internal block splitting to reduce fragmentation |
+
+Override via environment variable if needed:
+```bash
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.5,max_split_size_mb:64
+python -m runner
+```
+
 ## Troubleshooting
 
 ### CUDA Out of Memory
 
-Use a smaller model:
+Reduce VRAM fraction or use a smaller model:
 ```bash
+python -m runner --vram-fraction 0.5
 python -m runner --model micro_2L_64d
 ```
 
@@ -462,7 +487,7 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - PyTorch 2.0+ with CUDA
 - (Optional) matplotlib for charts
 

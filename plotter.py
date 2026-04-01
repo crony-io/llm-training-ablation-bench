@@ -30,7 +30,7 @@ def plot_jsonl(file_path: Path) -> None:
                 if data.get("_type") == "result":
                     bench_name = data.get("benchmark")
                     variant = data.get("variant")
-                    loss_curve = data.get("loss_curve", [])
+                    loss_curve = list(data.get("loss_curve", []))
                     final_loss = data.get("final_loss")
 
                     # Skip benchmarks that don't have a loss curve
@@ -93,10 +93,6 @@ if __name__ == "__main__":
     parser.add_argument("input_file", type=str, help="Path to the .jsonl file to plot")
     args = parser.parse_args()
 
-    # We redefine log as print when executing directly
-    import builtins
-    import logger
-
-    logger.log = builtins.print
-
+    # In standalone mode, the log module has no file handle open — its log()
+    # already prints to console, so we can call plot_jsonl directly.
     plot_jsonl(Path(args.input_file))

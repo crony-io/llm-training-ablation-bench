@@ -15,6 +15,7 @@ PTQ Variants (applied to a fully trained baseline):
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 
@@ -93,9 +94,7 @@ def run(
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
 
-    # =========================================================================
-    # PART 1: Quantization-Aware Training (QAT)
-    # =========================================================================
+    # Quantization-Aware Training (QAT)
     base_qat = replace(bench_cfg, use_qat=False)
 
     qat_variants: list[tuple[str, BenchmarkConfig]] = [
@@ -113,26 +112,26 @@ def run(
     for name, cfg in qat_variants:
         log(f"\n── Quantization (QAT): {name} ──")
         torch.manual_seed(cfg.seed)
-        model = TinyGPT(model_cfg, cfg).to(device)
         with VRAMTracker(device) as vt:
+            model = TinyGPT(model_cfg, cfg).to(device)
             result = run_micro_train(model, model_cfg, cfg, device, label=name)
-        result.peak_vram_mb = vt.peak_mb
+        if not result.cached:
+            result.peak_vram_mb = vt.peak_mb
         results.append(result)
         del model
         torch.cuda.empty_cache()
 
-    # =========================================================================
-    # PART 2: Post-Training Quantization (PTQ)
-    # =========================================================================
+    # Post-Training Quantization (PTQ)
     log("\n── Quantization (PTQ): Training Baseline Model ──")
 
-    # We alter the seed slightly to bypass the cache so we actually get trained weights to quantize!
-    ptq_cfg = replace(base_qat, seed=bench_cfg.seed + 777)
+    # Use the same seed as QAT for fair comparison; skip_cache ensures we
+    # actually train (we need the weights for quantization, not just metrics).
+    ptq_cfg = replace(base_qat)
     torch.manual_seed(ptq_cfg.seed)
     ptq_model = TinyGPT(model_cfg, ptq_cfg).to(device)
 
     # Train the model to full completion
-    run_micro_train(ptq_model, model_cfg, ptq_cfg, device, label="ptq_pretrain")
+    run_micro_train(ptq_model, model_cfg, ptq_cfg, device, label="ptq_pretrain", skip_cache=True)
 
     log("  Collecting Hessian data...")
     hessians = _collect_synthetic_hessian(
@@ -191,7 +190,10 @@ def run(
     loader = SyntheticTokenLoader(model_cfg.vocab_size, device, seed=999)
     x, y = loader.next_batch(bench_cfg.batch_size * 4, model_cfg.seq_len)
 
-    # 1. Per-row loss
+    # Save original trained weights so each PTQ method is evaluated independently
+    orig_trained_state = {k: v.clone() for k, v in ptq_model.state_dict().items()}
+
+    # Evaluate per-row quantized model
     ptq_model.load_state_dict(q_pr_state, strict=False)
     with VRAMTracker(device) as vt_pr:
         with (
@@ -201,7 +203,10 @@ def run(
             loss_pr = ptq_model(x, y).item()
     peak_vram_pr = vt_pr.peak_mb
 
-    # 2. GPTQ loss
+    # Restore original trained weights before GPTQ evaluation
+    ptq_model.load_state_dict(orig_trained_state)
+
+    # Evaluate GPTQ quantized model
     peak_vram_gptq = 0.0
     if q_gptq_state:
         ptq_model.load_state_dict(q_gptq_state, strict=False)
@@ -217,11 +222,13 @@ def run(
 
     mse_change = (
         ((avg_mse_gptq - avg_mse_pr) / avg_mse_pr * 100)
-        if avg_mse_gptq == avg_mse_gptq
+        if not math.isnan(avg_mse_gptq)
         else 0.0
     )
     ce_change = (
-        ((loss_gptq - loss_pr) / loss_pr * 100) if loss_gptq == loss_gptq else 0.0
+        ((loss_gptq - loss_pr) / loss_pr * 100)
+        if not math.isnan(loss_gptq)
+        else 0.0
     )
 
     log(f"\n  Quantization comparison ({layer_count} layers):")
